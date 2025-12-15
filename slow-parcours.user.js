@@ -33,6 +33,9 @@
         STERZO_STEERING:  '347b0030-7635-408b-8918-8ff3949ce592',
         STERZO_CP:        '347b0031-7635-408b-8918-8ff3949ce592',
         STERZO_CHALLENGE: '347b0032-7635-408b-8918-8ff3949ce592',
+        // Sterzo Opcodes
+        STERZO_OP_CHALLENGE: 0x1003,
+        STERZO_OP_RESPONSE: 0x1103,
     };
 
     // --- 1. Web Component (UI) ---
@@ -113,51 +116,91 @@
     customElements.define('ble-hud', BleHud);
 
     // --- State & Globals ---
-    const state = {
-        watts: 0, smoothWatts: 0, angle: 0,
-        trainerStatus: 'disconnected', sterzoStatus: 'disconnected', isControllable: false,
-        trainerReportsResistance: false, // Flag to check if hardware reports real resistance
-        gameStatus: 'Searching...',
-        realGrade: 0, realSpeed: 0, smoothSpeed: 0,
-        resistanceLevel: 0
-    };
+    // --- State & Globals ---
 
-    let trainerControlChar = null;
-    let hudElement = null;
+    class StateManager {
+        constructor() {
+            this._state = {
+                watts: 0, smoothWatts: 0, angle: 0,
+                trainerStatus: 'disconnected', sterzoStatus: 'disconnected', isControllable: false,
+                trainerReportsResistance: false,
+                gameStatus: 'Searching...',
+                realGrade: 0, realSpeed: 0, smoothSpeed: 0,
+                resistanceLevel: 0
+            };
+            this.hudElement = null;
+        }
 
-    function handleDebugInput(e) {
-        // Only allow manual overrides if no trainer is connected
-        if (state.trainerStatus === 'connected') return;
+        initUI() {
+            if (!document.querySelector('ble-hud')) {
+                this.hudElement = document.createElement('ble-hud');
+                document.body.appendChild(this.hudElement);
+            } else {
+                this.hudElement = document.querySelector('ble-hud');
+            }
+        }
 
-        if (e.key === '=' || e.key === '+') {
-            state.watts = state.watts + 20;
-            updateUI();
-        } else if (e.key === '-' || e.key === '_') {
-            state.watts = Math.max(0, state.watts - 20);
-            updateUI();
+        // Getters and Setters
+        get watts() { return this._state.watts; }
+        set watts(val) { this._state.watts = val; this.render(); }
+
+        get smoothWatts() { return this._state.smoothWatts; }
+        set smoothWatts(val) { this._state.smoothWatts = val; this.render(); }
+
+        get angle() { return this._state.angle; }
+        set angle(val) { this._state.angle = val; this.render(); }
+
+        get trainerStatus() { return this._state.trainerStatus; }
+        set trainerStatus(val) { this._state.trainerStatus = val; this.render(); }
+
+        get sterzoStatus() { return this._state.sterzoStatus; }
+        set sterzoStatus(val) { this._state.sterzoStatus = val; this.render(); }
+
+        get gameStatus() { return this._state.gameStatus; }
+        set gameStatus(val) { this._state.gameStatus = val; this.render(); }
+
+        get isControllable() { return this._state.isControllable; }
+        set isControllable(val) { this._state.isControllable = val; this.render(); }
+
+        get trainerReportsResistance() { return this._state.trainerReportsResistance; }
+        set trainerReportsResistance(val) { this._state.trainerReportsResistance = val; }
+
+        get resistanceLevel() { return this._state.resistanceLevel; }
+        set resistanceLevel(val) { this._state.resistanceLevel = val; this.render(); }
+
+        get realGrade() { return this._state.realGrade; }
+        set realGrade(val) { this._state.realGrade = val; this.render(); }
+
+        get realSpeed() { return this._state.realSpeed; }
+        set realSpeed(val) {
+            this._state.realSpeed = val;
+            this._state.smoothSpeed += (val - this._state.smoothSpeed) * CONFIG.SPEED_SMOOTHING;
+            this.render();
+        }
+
+        get smoothSpeed() { return this._state.smoothSpeed; }
+
+        render() {
+            if (!this.hudElement) return;
+            const s = this._state;
+            const kph = s.smoothSpeed * 3.6;
+            this.hudElement.setAttribute('watts', Math.round(s.smoothWatts));
+            this.hudElement.setAttribute('speed', kph.toFixed(1));
+            this.hudElement.setAttribute('grade', s.realGrade.toFixed(1));
+            this.hudElement.setAttribute('angle', s.angle.toFixed(1));
+            this.hudElement.setAttribute('resistance', Math.round(s.resistanceLevel));
+            this.hudElement.setAttribute('game-status', s.gameStatus);
+            this.hudElement.setAttribute('trainer-status', s.trainerStatus);
+            this.hudElement.setAttribute('sterzo-status', s.sterzoStatus);
         }
     }
-
-    function updateUI() {
-        if (!hudElement) return;
-        const kph = state.smoothSpeed * 3.6;
-        hudElement.setAttribute('watts', Math.round(state.smoothWatts));
-        hudElement.setAttribute('speed', kph.toFixed(1));
-        hudElement.setAttribute('grade', state.realGrade.toFixed(1));
-        hudElement.setAttribute('angle', state.angle.toFixed(1));
-        hudElement.setAttribute('resistance', Math.round(state.resistanceLevel));
-        hudElement.setAttribute('game-status', state.gameStatus);
-        hudElement.setAttribute('trainer-status', state.trainerStatus);
-        hudElement.setAttribute('sterzo-status', state.sterzoStatus);
-    }
-
-    // --- 2. Physics Engine (Output Logic) ---
 
     // --- 2. Physics Engine (Output Logic) ---
 
     class PhysicsEngine {
-        constructor(trainer) {
+        constructor(stateManager, trainer) {
             this.lastUpdate = 0;
+            this.sm = stateManager;
             this.trainer = trainer;
         }
 
@@ -186,20 +229,22 @@
 
             this.updateTuning(gameHook.player);
 
+            const state = this.sm;
+
             // 1. Calculate Grade + copy over Speed
             const pitchRadians = gameHook.player.rotation.z;
             const gradePercent = Math.tan(pitchRadians) * 100;
-            state.realGrade = gradePercent;
 
-            state.realSpeed = gameHook.player.speed;
-            state.smoothSpeed += (gameHook.player.speed - state.smoothSpeed) * CONFIG.SPEED_SMOOTHING;
+            // Update State
+            this.sm.realGrade = gradePercent;
+            this.sm.realSpeed = gameHook.player.speed;
 
             // Visual Estimation for UI Load Bar
             let estimatedRes = CONFIG.BASE_RESISTANCE + (gradePercent * CONFIG.GRADE_FACTOR);
             estimatedRes = Math.max(0, Math.min(200, estimatedRes));
 
             if (!state.trainerReportsResistance) {
-                state.resistanceLevel = estimatedRes;
+                 this.sm.resistanceLevel = estimatedRes;
             }
 
             // Only update trainer if connected and controllable
@@ -216,7 +261,8 @@
     // --- 3. Virtual Gamepad (Input Logic) ---
 
     class VirtualGamepad {
-        constructor() {
+        constructor(stateManager) {
+            this.sm = stateManager;
             this.index = 0;
             this.connected = true;
             this.timestamp = 0;
@@ -266,6 +312,7 @@
 
         update() {
             this.timestamp = performance.now();
+            const state = this.sm;
 
             // 1. Steering Mapping
             let rawAngle = state.angle;
@@ -278,10 +325,11 @@
                 const ratio = adjustedAngle / activeRange;
                 steerOutput = Math.max(-1, Math.min(1, ratio)) * Math.sign(rawAngle);
             }
-            this.axes[0] = steerOutput * -1;
+            this.axes[0] = steerOutput;
 
             // 2. Throttle Mapping
             state.smoothWatts += (state.watts - state.smoothWatts) * CONFIG.SMOOTHING;
+
             const throttleNorm = this.mapWattsToThrottle(state.smoothWatts, state.realSpeed, CONFIG.SYSTEM_MASS, CONFIG.SCALING_FACTOR)
 
             this.buttons[7].value = throttleNorm > 0.05 ? throttleNorm : 0;
@@ -295,7 +343,8 @@
     // --- 4. Scene Graph & Loop Coordinator ---
 
     class GameHook {
-        constructor() {
+        constructor(stateManager) {
+            this.sm = stateManager;
             this.scene = null;
             this.player = null;
             this.lastPos = null;
@@ -331,15 +380,13 @@
                 // 1. Maintain Link
                 if (this.scene && !this.player) this.findPlayer();
 
-                updateUI();
                 return originalRAF(callback);
             };
         }
 
         foundScene(scene) {
             this.scene = scene;
-            state.gameStatus = "Linked";
-            updateUI();
+            this.sm.gameStatus = "Linked";
         }
 
         traverseObjectTree( rootObject, callback, skipDuplicates = false ) {
@@ -362,8 +409,7 @@
             this.traverseObjectTree(this.scene, (obj) => {
                 if (this.knownNames.has(obj.type)) {
                     this.player = obj;
-                    state.gameStatus = `Linked: ${obj.type}`;
-                    updateUI();
+                    this.sm.gameStatus = `Linked: ${obj.type}`;
                 }
             });
         }
@@ -371,13 +417,14 @@
     // --- 5. BLE Logic ---
 
     class TrainerController {
-        constructor() {
+        constructor(stateManager) {
+            this.sm = stateManager;
             this.controlChar = null;
         }
 
         async connect() {
             try {
-                state.trainerStatus = 'connecting'; updateUI();
+                this.sm.trainerStatus = 'connecting';
                 const device = await navigator.bluetooth.requestDevice({
                     filters: [{ services: [CONFIG.FTMS_SERVICE] }],
                     optionalServices: [CONFIG.CPS_SERVICE]
@@ -389,7 +436,7 @@
                     try {
                         this.controlChar = await service.getCharacteristic(CONFIG.FTMS_CONTROL);
                         await this.controlChar.writeValue(new Uint8Array([0x00])); // Request Control
-                        state.isControllable = true;
+                        this.sm.isControllable = true;
                     } catch(e) { console.log("Control Point fail", e); }
 
                     const dataChar = await service.getCharacteristic(CONFIG.FTMS_DATA);
@@ -402,16 +449,19 @@
                     const char = await service.getCharacteristic(CONFIG.CPS_MEASUREMENT);
                     await char.startNotifications();
                     char.addEventListener('characteristicvaluechanged', (e) => {
-                        state.watts = e.target.value.getInt16(2, true);
-                        updateUI();
+                        this.sm.watts = e.target.value.getInt16(2, true);
                     });
                 }
 
                 device.addEventListener('gattserverdisconnected', () => {
-                    state.trainerStatus = 'disconnected'; state.isControllable = false; updateUI();
+                    this.sm.trainerStatus = 'disconnected';
+                    this.sm.isControllable = false;
                 });
-                state.trainerStatus = 'connected'; updateUI();
-            } catch (e) { console.error(e); state.trainerStatus = 'disconnected'; updateUI(); }
+                this.sm.trainerStatus = 'connected';
+            } catch (e) {
+                console.error(e);
+                this.sm.trainerStatus = 'disconnected';
+            }
         }
 
         handleFtmsData(val) {
@@ -430,15 +480,14 @@
              if (flags & (1 << 4)) offset += 3;
              // Flag 5: Resistance Level (sint16)
              if (flags & (1 << 5)) {
-                 state.resistanceLevel = val.getInt16(offset, true);
-                 state.trainerReportsResistance = true;
+                 this.sm.resistanceLevel = val.getInt16(offset, true);
+                 this.sm.trainerReportsResistance = true;
                  offset += 2;
              }
              // Flag 6: Inst Power (sint16)
              if (flags & (1 << 6)) {
-                 state.watts = val.getInt16(offset, true);
+                 this.sm.watts = val.getInt16(offset, true);
              }
-             updateUI();
         }
 
         async sendIncline(grade) {
@@ -456,7 +505,9 @@
     }
 
     class SterzoController {
-        constructor() {}
+        constructor(stateManager) {
+            this.sm = stateManager;
+        }
 
         calculateResponseCode(challenge) {
             const n = challenge % 11;
@@ -467,7 +518,7 @@
 
         async connect() {
              try {
-                state.sterzoStatus = 'connecting'; updateUI();
+                this.sm.sterzoStatus = 'connecting';
                 const device = await navigator.bluetooth.requestDevice({
                     filters: [{ services: [CONFIG.STERZO_SERVICE] }]
                 });
@@ -487,19 +538,18 @@
                 await steeringChar.startNotifications();
                 steeringChar.addEventListener('characteristicvaluechanged', (e) => {
                     if (e.target.value.byteLength >= 4) {
-                         state.angle = e.target.value.getFloat32(0, true);
-                         updateUI();
+                         this.sm.angle = e.target.value.getFloat32(0, true);
                     }
                 });
 
                 device.addEventListener('gattserverdisconnected', () => {
-                    state.sterzoStatus = 'disconnected'; updateUI();
+                    this.sm.sterzoStatus = 'disconnected';
                 });
 
-                state.sterzoStatus = 'connected'; updateUI();
+                this.sm.sterzoStatus = 'connected';
             } catch(e) {
                 console.error("Sterzo Connection Failed", e);
-                state.sterzoStatus = 'disconnected'; updateUI();
+                this.sm.sterzoStatus = 'disconnected';
             }
         }
 
@@ -512,7 +562,7 @@
                     const opCode = val.getUint16(0, true);
 
                     if (stage === 'challenge') {
-                        if (opCode === 0x1003 && val.byteLength >= 4) {
+                        if (opCode === CONFIG.STERZO_OP_CHALLENGE && val.byteLength >= 4) {
                              const challenge = val.getUint16(2, true);
                              console.log(`Sterzo: Challenge Received. Op: ${opCode.toString(16)}, Ch: ${challenge}`);
 
@@ -529,7 +579,7 @@
                              stage = 'finished';
                         }
                     } else if (stage === 'finished') {
-                        if (opCode === 0x1103 && val.byteLength >= 3) {
+                        if (opCode === CONFIG.STERZO_OP_RESPONSE && val.byteLength >= 3) {
                              const status = val.getUint8(2);
                              console.log(`Sterzo: Finished Received. Status: ${status.toString(16)}`);
 
@@ -557,27 +607,38 @@
     // --- 6. Initialization ---
 
     const originalGetGamepads = navigator.getGamepads.bind(navigator);
-    const vPad = new VirtualGamepad();
+    const stateManager = new StateManager();
+    const vPad = new VirtualGamepad(stateManager);
     let isActive = false;
 
     // Instantiate classes
-    const gameHook = new GameHook();
+    const gameHook = new GameHook(stateManager);
 
     // Create Controllers
-    const trainerController = new TrainerController();
-    const sterzoController = new SterzoController();
-    const physicsEngine = new PhysicsEngine(trainerController);
+    const trainerController = new TrainerController(stateManager);
+    const sterzoController = new SterzoController(stateManager);
+    const physicsEngine = new PhysicsEngine(stateManager, trainerController);
 
     // Update Init Logic to use classes
     function initUI() {
-        if (!document.querySelector('ble-hud')) {
-            hudElement = document.createElement('ble-hud');
-            document.body.appendChild(hudElement);
-            // Bind to class methods
-            hudElement.addEventListener('pair-trainer', () => trainerController.connect());
-            hudElement.addEventListener('pair-sterzo', () => sterzoController.connect());
+        stateManager.initUI();
+        if (stateManager.hudElement) {
+             const el = stateManager.hudElement;
+             el.addEventListener('pair-trainer', () => trainerController.connect());
+             el.addEventListener('pair-sterzo', () => sterzoController.connect());
+        }
+        window.addEventListener('keydown', handleDebugInput);
+    }
 
-            window.addEventListener('keydown', handleDebugInput);
+    function handleDebugInput(e) {
+        // Only allow manual overrides if no trainer is connected
+         const s = stateManager;
+        if (s.trainerStatus === 'connected') return;
+
+        if (e.key === '=' || e.key === '+') {
+            stateManager.watts = s.watts + 20;
+        } else if (e.key === '-' || e.key === '_') {
+            stateManager.watts = Math.max(0, s.watts - 20);
         }
     }
 
