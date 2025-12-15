@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         SlowRoads.io BLE Hardware Bridge (FTMS Sim Mode)
+// @name         Slow Parcours
 // @namespace    http://tampermonkey.net/
 // @version      8.6
 // @description  Controls Smart Trainers via FTMS Sim Mode (Incline). Physics update loop synchronized with Game Input polling.
@@ -29,9 +29,10 @@
         CPS_MEASUREMENT: 0x2A63,
         SYSTEM_MASS: 85, // Mass of rider + bike (kg)
         SCALING_FACTOR: 1.0, // Multiplier. 1.0 = Realistic. 2.0 = E-Bike/Arcade feel.
-        STERZO_SERVICE: '347b0001-7635-408b-8918-8ff3949ce592',
-        STERZO_CP:      '347b0031-7635-408b-8918-8ff3949ce592',
-        STERZO_DATA:    '347b0032-7635-408b-8918-8ff3949ce592',
+        STERZO_SERVICE:   '347b0001-7635-408b-8918-8ff3949ce592',
+        STERZO_STEERING:  '347b0030-7635-408b-8918-8ff3949ce592',
+        STERZO_CP:        '347b0031-7635-408b-8918-8ff3949ce592',
+        STERZO_CHALLENGE: '347b0032-7635-408b-8918-8ff3949ce592',
     };
 
     // --- 1. Web Component (UI) ---
@@ -475,24 +476,124 @@
         } catch (e) { console.error(e); state.trainerStatus = 'disconnected'; updateUI(); }
     }
 
+    // --- Sterzo Helpers ---
+
+    const calculateResponseCode = (challenge) => {
+        const n = challenge % 11;
+        const m = ((challenge << n) | (challenge >> (16 - n))) % 65536;
+        const x = ((challenge + 38550) ^ m) % 65536;
+        return x % 65336;
+    };
+
     async function connectSterzo() {
         try {
             state.sterzoStatus = 'connecting'; updateUI();
-            const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [CONFIG.STERZO_SERVICE] }] });
+            const device = await navigator.bluetooth.requestDevice({
+                filters: [{ services: [CONFIG.STERZO_SERVICE] }]
+            });
             const server = await device.gatt.connect();
             const service = await server.getPrimaryService(CONFIG.STERZO_SERVICE);
 
-            const cp = await service.getCharacteristic(CONFIG.STERZO_CP);
-            await cp.writeValue(new Uint8Array([0x03, 0x10]));
+            const cpChar = await service.getCharacteristic(CONFIG.STERZO_CP);
+            const challengeChar = await service.getCharacteristic(CONFIG.STERZO_CHALLENGE);
+            const steeringChar = await service.getCharacteristic(CONFIG.STERZO_STEERING);
 
-            const data = await service.getCharacteristic(CONFIG.STERZO_DATA);
-            await data.startNotifications();
-            data.addEventListener('characteristicvaluechanged', (e) => {
-                state.angle = e.target.value.getFloat32(0, true);
-                updateUI();
+            console.log("Sterzo: Characteristics found. Starting Handshake...");
+
+            // --- Handshake ---
+            await new Promise((resolve, reject) => {
+                let stage = 'challenge'; // challenge -> finished
+
+                const onValue = async (e) => {
+                    const val = e.target.value;
+                    if (val.byteLength < 2) return;
+
+                    const opCode = val.getUint16(0, true);
+
+                    if (stage === 'challenge') {
+                        // Expecting 0x1003 (03 10) - InitChallenge
+                        if (opCode === 0x1003 && val.byteLength >= 4) {
+                             const challenge = val.getUint16(2, true);
+                             console.log(`Sterzo: Challenge Received. Op: ${opCode.toString(16)}, Ch: ${challenge}`);
+
+                             // CALCULATE RESPONSE
+                             const response = calculateResponseCode(challenge);
+
+                             // WAIT 500ms (as per sample)
+                             await new Promise(r => setTimeout(r, 500));
+
+                             // SEND RESPONSE
+                             console.log(`Sterzo: Sending Response: ${response}`);
+                             const buffer = new ArrayBuffer(4);
+                             const view = new DataView(buffer);
+                             view.setUint8(0, 0x03);
+                             view.setUint8(1, 0x11);
+                             view.setUint16(2, response, true);
+                             await cpChar.writeValue(buffer);
+
+                             stage = 'finished';
+                        }
+                    } else if (stage === 'finished') {
+                        // Expecting 0x1103 (03 11) - ResponseFinished
+                        if (opCode === 0x1103 && val.byteLength >= 3) {
+                             const status = val.getUint8(2); // StatusCode
+                             console.log(`Sterzo: Finished Received. Status: ${status.toString(16)}`);
+
+                             if (status === 0xFF || status === 0xFE) { // Accepted or Rejected (Check sample?)
+                                 // Sample says if (status === StatusCode.Rejected) throw...
+                                 if (status === 0xFE) {
+                                     reject(new Error("Sterzo Handshake Rejected"));
+                                     challengeChar.stopNotifications();
+                                     challengeChar.removeEventListener('characteristicvaluechanged', onValue);
+                                     return;
+                                 }
+
+                                 // Clean up
+                                 challengeChar.stopNotifications();
+                                 challengeChar.removeEventListener('characteristicvaluechanged', onValue);
+                                 resolve();
+                             }
+                        }
+                    }
+                };
+
+                challengeChar.startNotifications().then(async () => {
+                    challengeChar.addEventListener('characteristicvaluechanged', onValue);
+                    // Initiate: 0x03, 0x10
+                    // Wait 500ms before init as per sample "Geriatric protocol"
+                    await new Promise(r => setTimeout(r, 500));
+                    return cpChar.writeValue(new Uint8Array([0x03, 0x10]));
+                }).catch(reject);
             });
+
+            console.log("Sterzo: Handshake complete. Subscribing to Steering...");
+
+            // --- Steering Data ---
+            await steeringChar.startNotifications();
+            steeringChar.addEventListener('characteristicvaluechanged', (e) => {
+                // Steering Value seems to be simple float?
+                // Sample: decodeValue(dataView) -> parseSteeringData just logs?
+                // Wait, sample `parseSteeringData` returns {} and logs bytes.
+                // But userscript previously assumed float32 at index 0?
+                // "state.angle = e.target.value.getFloat32(0, true);"
+                // Let's assume the previous logic for *reading* the angle was partially guessing or correct for the actual data characteristic.
+                // The sample doesn't actually show the parsing logic for steering data, just logging.
+                // I will stick to the previous float32 assumption but on the correct characteristic (STERZO_STEERING now).
+                if (e.target.value.byteLength >= 4) {
+                     state.angle = e.target.value.getFloat32(0, true);
+                     updateUI();
+                }
+            });
+
+            device.addEventListener('gattserverdisconnected', () => {
+                state.sterzoStatus = 'disconnected'; updateUI();
+            });
+
             state.sterzoStatus = 'connected'; updateUI();
-        } catch(e) { state.sterzoStatus = 'disconnected'; updateUI(); }
+        } catch(e) {
+            console.error("Sterzo Connection Failed", e);
+            state.sterzoStatus = 'disconnected'; updateUI();
+        }
     }
 
     // --- 6. Initialization ---
