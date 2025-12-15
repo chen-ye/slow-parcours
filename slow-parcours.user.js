@@ -125,18 +125,6 @@
     let trainerControlChar = null;
     let hudElement = null;
 
-    function initUI() {
-        if (!document.querySelector('ble-hud')) {
-            hudElement = document.createElement('ble-hud');
-            document.body.appendChild(hudElement);
-            hudElement.addEventListener('pair-trainer', connectTrainer);
-            hudElement.addEventListener('pair-sterzo', connectSterzo);
-
-            // Debug Key Listener
-            window.addEventListener('keydown', handleDebugInput);
-        }
-    }
-
     function handleDebugInput(e) {
         // Only allow manual overrides if no trainer is connected
         if (state.trainerStatus === 'connected') return;
@@ -165,9 +153,12 @@
 
     // --- 2. Physics Engine (Output Logic) ---
 
+    // --- 2. Physics Engine (Output Logic) ---
+
     class PhysicsEngine {
-        constructor() {
+        constructor(trainer) {
             this.lastUpdate = 0;
+            this.trainer = trainer;
         }
 
         /**
@@ -191,10 +182,8 @@
         }
 
         update(timestamp) {
-            // Need gameHook to access player for physics calculations
             if (!gameHook || !gameHook.player) return;
 
-            // For now, update this per tick since it may get overwritten by the game
             this.updateTuning(gameHook.player);
 
             // 1. Calculate Grade + copy over Speed
@@ -206,12 +195,9 @@
             state.smoothSpeed += (gameHook.player.speed - state.smoothSpeed) * CONFIG.SPEED_SMOOTHING;
 
             // Visual Estimation for UI Load Bar
-            // We calculate estimatedRes for control logic
             let estimatedRes = CONFIG.BASE_RESISTANCE + (gradePercent * CONFIG.GRADE_FACTOR);
             estimatedRes = Math.max(0, Math.min(200, estimatedRes));
 
-            // If the trainer does NOT report its own resistance, we use the estimated one for the UI
-            // If it DOES report (flag set in connectTrainer), we let the BLE callback handle state.resistanceLevel
             if (!state.trainerReportsResistance) {
                 state.resistanceLevel = estimatedRes;
             }
@@ -222,31 +208,8 @@
             // Rate limit to prevent BLE congestion
             if (timestamp - this.lastUpdate < CONFIG.RESISTANCE_UPDATE_RATE) return;
 
-            this.sendIncline(gradePercent);
+            this.trainer.sendIncline(gradePercent);
             this.lastUpdate = timestamp;
-        }
-
-        async sendIncline(grade) {
-            if (!trainerControlChar) return;
-            try {
-                // FTMS OpCode 0x11: Set Target Inclination
-                // Range: -100% to 100%
-                // Resolution: 0.1%
-                // Type: SINT16 (Little Endian)
-
-                // Clamp grade to reasonable limits
-                const clamped = Math.max(-25, Math.min(40, grade));
-                const value = Math.round(clamped * 10);
-
-                const buffer = new ArrayBuffer(3);
-                const view = new DataView(buffer);
-                view.setUint8(0, 0x11); // OpCode
-                view.setInt16(1, value, true); // Value
-
-                await trainerControlChar.writeValue(buffer);
-            } catch (e) {
-                console.warn("BLE Write Fail", e);
-            }
         }
     }
 
@@ -405,124 +368,157 @@
             });
         }
     }
-
     // --- 5. BLE Logic ---
 
-    async function connectTrainer() {
-        try {
-            state.trainerStatus = 'connecting'; updateUI();
-            const device = await navigator.bluetooth.requestDevice({
-                filters: [{ services: [CONFIG.FTMS_SERVICE] }],
-                optionalServices: [CONFIG.CPS_SERVICE]
-            });
-            const server = await device.gatt.connect();
+    class TrainerController {
+        constructor() {
+            this.controlChar = null;
+        }
 
-            let service;
+        async connect() {
             try {
-                service = await server.getPrimaryService(CONFIG.FTMS_SERVICE);
+                state.trainerStatus = 'connecting'; updateUI();
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [CONFIG.FTMS_SERVICE] }],
+                    optionalServices: [CONFIG.CPS_SERVICE]
+                });
+                const server = await device.gatt.connect();
+
                 try {
-                    trainerControlChar = await service.getCharacteristic(CONFIG.FTMS_CONTROL);
-                    await trainerControlChar.writeValue(new Uint8Array([0x00]));
-                    state.isControllable = true;
-                } catch(e) { console.log("Control Point fail", e); }
+                    const service = await server.getPrimaryService(CONFIG.FTMS_SERVICE);
+                    try {
+                        this.controlChar = await service.getCharacteristic(CONFIG.FTMS_CONTROL);
+                        await this.controlChar.writeValue(new Uint8Array([0x00])); // Request Control
+                        state.isControllable = true;
+                    } catch(e) { console.log("Control Point fail", e); }
 
-                const dataChar = await service.getCharacteristic(CONFIG.FTMS_DATA);
-                await dataChar.startNotifications();
-                dataChar.addEventListener('characteristicvaluechanged', (e) => {
-                     const val = e.target.value;
-                     const flags = val.getUint16(0, true);
-                     let offset = 2; // Flags is 2 bytes
+                    const dataChar = await service.getCharacteristic(CONFIG.FTMS_DATA);
+                    await dataChar.startNotifications();
+                    dataChar.addEventListener('characteristicvaluechanged', (e) => this.handleFtmsData(e.target.value));
 
-                     // Flag 0: Inst Speed (uint16)
-                     if (flags & (1 << 0)) offset += 2;
-                     // Flag 1: Avg Speed (uint16)
-                     if (flags & (1 << 1)) offset += 2;
-                     // Flag 2: Inst Cadence (uint16)
-                     if (flags & (1 << 2)) offset += 2;
-                     // Flag 3: Avg Cadence (uint16)
-                     if (flags & (1 << 3)) offset += 2;
-                     // Flag 4: Total Distance (uint24)
-                     if (flags & (1 << 4)) offset += 3;
-                     // Flag 5: Resistance Level (sint16)
-                     if (flags & (1 << 5)) {
-                         state.resistanceLevel = val.getInt16(offset, true);
-                         state.trainerReportsResistance = true;
-                         offset += 2;
-                     }
-                     // Flag 6: Inst Power (sint16)
-                     if (flags & (1 << 6)) {
-                         state.watts = val.getInt16(offset, true);
-                         // offset += 2;
-                     }
+                } catch (e) {
+                    console.log("Falling back to CPS");
+                    const service = await server.getPrimaryService(CONFIG.CPS_SERVICE);
+                    const char = await service.getCharacteristic(CONFIG.CPS_MEASUREMENT);
+                    await char.startNotifications();
+                    char.addEventListener('characteristicvaluechanged', (e) => {
+                        state.watts = e.target.value.getInt16(2, true);
+                        updateUI();
+                    });
+                }
 
-                     updateUI();
+                device.addEventListener('gattserverdisconnected', () => {
+                    state.trainerStatus = 'disconnected'; state.isControllable = false; updateUI();
                 });
-            } catch (e) {
-                console.log("Falling back to CPS");
-                service = await server.getPrimaryService(CONFIG.CPS_SERVICE);
-                const char = await service.getCharacteristic(CONFIG.CPS_MEASUREMENT);
-                await char.startNotifications();
-                char.addEventListener('characteristicvaluechanged', (e) => {
-                    // Standard CPS: Flags (16) + Power (sint16) at offset 2 usually
-                    state.watts = e.target.value.getInt16(2, true);
-                    updateUI();
-                });
-            }
+                state.trainerStatus = 'connected'; updateUI();
+            } catch (e) { console.error(e); state.trainerStatus = 'disconnected'; updateUI(); }
+        }
 
-            device.addEventListener('gattserverdisconnected', () => {
-                state.trainerStatus = 'disconnected'; state.isControllable = false; updateUI();
-            });
-            state.trainerStatus = 'connected'; updateUI();
-        } catch (e) { console.error(e); state.trainerStatus = 'disconnected'; updateUI(); }
+        handleFtmsData(val) {
+             const flags = val.getUint16(0, true);
+             let offset = 2; // Flags is 2 bytes
+
+             // Flag 0: Inst Speed (uint16)
+             if (flags & (1 << 0)) offset += 2;
+             // Flag 1: Avg Speed (uint16)
+             if (flags & (1 << 1)) offset += 2;
+             // Flag 2: Inst Cadence (uint16)
+             if (flags & (1 << 2)) offset += 2;
+             // Flag 3: Avg Cadence (uint16)
+             if (flags & (1 << 3)) offset += 2;
+             // Flag 4: Total Distance (uint24)
+             if (flags & (1 << 4)) offset += 3;
+             // Flag 5: Resistance Level (sint16)
+             if (flags & (1 << 5)) {
+                 state.resistanceLevel = val.getInt16(offset, true);
+                 state.trainerReportsResistance = true;
+                 offset += 2;
+             }
+             // Flag 6: Inst Power (sint16)
+             if (flags & (1 << 6)) {
+                 state.watts = val.getInt16(offset, true);
+             }
+             updateUI();
+        }
+
+        async sendIncline(grade) {
+            if (!this.controlChar) return;
+            try {
+                const clamped = Math.max(-25, Math.min(40, grade));
+                const value = Math.round(clamped * 10);
+                const buffer = new ArrayBuffer(3);
+                const view = new DataView(buffer);
+                view.setUint8(0, 0x11);
+                view.setInt16(1, value, true);
+                await this.controlChar.writeValue(buffer);
+            } catch (e) { console.warn("BLE Write Fail", e); }
+        }
     }
 
-    // --- Sterzo Helpers ---
+    class SterzoController {
+        constructor() {}
 
-    const calculateResponseCode = (challenge) => {
-        const n = challenge % 11;
-        const m = ((challenge << n) | (challenge >> (16 - n))) % 65536;
-        const x = ((challenge + 38550) ^ m) % 65536;
-        return x % 65336;
-    };
+        calculateResponseCode(challenge) {
+            const n = challenge % 11;
+            const m = ((challenge << n) | (challenge >> (16 - n))) % 65536;
+            const x = ((challenge + 38550) ^ m) % 65536;
+            return x % 65336;
+        }
 
-    async function connectSterzo() {
-        try {
-            state.sterzoStatus = 'connecting'; updateUI();
-            const device = await navigator.bluetooth.requestDevice({
-                filters: [{ services: [CONFIG.STERZO_SERVICE] }]
-            });
-            const server = await device.gatt.connect();
-            const service = await server.getPrimaryService(CONFIG.STERZO_SERVICE);
+        async connect() {
+             try {
+                state.sterzoStatus = 'connecting'; updateUI();
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [CONFIG.STERZO_SERVICE] }]
+                });
+                const server = await device.gatt.connect();
+                const service = await server.getPrimaryService(CONFIG.STERZO_SERVICE);
 
-            const cpChar = await service.getCharacteristic(CONFIG.STERZO_CP);
-            const challengeChar = await service.getCharacteristic(CONFIG.STERZO_CHALLENGE);
-            const steeringChar = await service.getCharacteristic(CONFIG.STERZO_STEERING);
+                const cpChar = await service.getCharacteristic(CONFIG.STERZO_CP);
+                const challengeChar = await service.getCharacteristic(CONFIG.STERZO_CHALLENGE);
+                const steeringChar = await service.getCharacteristic(CONFIG.STERZO_STEERING);
 
-            console.log("Sterzo: Characteristics found. Starting Handshake...");
+                console.log("Sterzo: Characteristics found. Starting Handshake...");
 
-            // --- Handshake ---
-            await new Promise((resolve, reject) => {
-                let stage = 'challenge'; // challenge -> finished
+                await this.performHandshake(cpChar, challengeChar);
 
+                console.log("Sterzo: Handshake complete. Subscribing to Steering...");
+
+                await steeringChar.startNotifications();
+                steeringChar.addEventListener('characteristicvaluechanged', (e) => {
+                    if (e.target.value.byteLength >= 4) {
+                         state.angle = e.target.value.getFloat32(0, true);
+                         updateUI();
+                    }
+                });
+
+                device.addEventListener('gattserverdisconnected', () => {
+                    state.sterzoStatus = 'disconnected'; updateUI();
+                });
+
+                state.sterzoStatus = 'connected'; updateUI();
+            } catch(e) {
+                console.error("Sterzo Connection Failed", e);
+                state.sterzoStatus = 'disconnected'; updateUI();
+            }
+        }
+
+        async performHandshake(cpChar, challengeChar) {
+            return new Promise((resolve, reject) => {
+                let stage = 'challenge';
                 const onValue = async (e) => {
                     const val = e.target.value;
                     if (val.byteLength < 2) return;
-
                     const opCode = val.getUint16(0, true);
 
                     if (stage === 'challenge') {
-                        // Expecting 0x1003 (03 10) - InitChallenge
                         if (opCode === 0x1003 && val.byteLength >= 4) {
                              const challenge = val.getUint16(2, true);
                              console.log(`Sterzo: Challenge Received. Op: ${opCode.toString(16)}, Ch: ${challenge}`);
 
-                             // CALCULATE RESPONSE
-                             const response = calculateResponseCode(challenge);
-
-                             // WAIT 500ms (as per sample)
+                             const response = this.calculateResponseCode(challenge);
                              await new Promise(r => setTimeout(r, 500));
 
-                             // SEND RESPONSE
                              console.log(`Sterzo: Sending Response: ${response}`);
                              const buffer = new ArrayBuffer(4);
                              const view = new DataView(buffer);
@@ -530,28 +526,20 @@
                              view.setUint8(1, 0x11);
                              view.setUint16(2, response, true);
                              await cpChar.writeValue(buffer);
-
                              stage = 'finished';
                         }
                     } else if (stage === 'finished') {
-                        // Expecting 0x1103 (03 11) - ResponseFinished
                         if (opCode === 0x1103 && val.byteLength >= 3) {
-                             const status = val.getUint8(2); // StatusCode
+                             const status = val.getUint8(2);
                              console.log(`Sterzo: Finished Received. Status: ${status.toString(16)}`);
 
-                             if (status === 0xFF || status === 0xFE) { // Accepted or Rejected (Check sample?)
-                                 // Sample says if (status === StatusCode.Rejected) throw...
+                             if (status === 0xFF || status === 0xFE) {
                                  if (status === 0xFE) {
                                      reject(new Error("Sterzo Handshake Rejected"));
-                                     challengeChar.stopNotifications();
-                                     challengeChar.removeEventListener('characteristicvaluechanged', onValue);
-                                     return;
                                  }
-
-                                 // Clean up
                                  challengeChar.stopNotifications();
                                  challengeChar.removeEventListener('characteristicvaluechanged', onValue);
-                                 resolve();
+                                 if (status === 0xFF) resolve();
                              }
                         }
                     }
@@ -559,40 +547,10 @@
 
                 challengeChar.startNotifications().then(async () => {
                     challengeChar.addEventListener('characteristicvaluechanged', onValue);
-                    // Initiate: 0x03, 0x10
-                    // Wait 500ms before init as per sample "Geriatric protocol"
                     await new Promise(r => setTimeout(r, 500));
                     return cpChar.writeValue(new Uint8Array([0x03, 0x10]));
                 }).catch(reject);
             });
-
-            console.log("Sterzo: Handshake complete. Subscribing to Steering...");
-
-            // --- Steering Data ---
-            await steeringChar.startNotifications();
-            steeringChar.addEventListener('characteristicvaluechanged', (e) => {
-                // Steering Value seems to be simple float?
-                // Sample: decodeValue(dataView) -> parseSteeringData just logs?
-                // Wait, sample `parseSteeringData` returns {} and logs bytes.
-                // But userscript previously assumed float32 at index 0?
-                // "state.angle = e.target.value.getFloat32(0, true);"
-                // Let's assume the previous logic for *reading* the angle was partially guessing or correct for the actual data characteristic.
-                // The sample doesn't actually show the parsing logic for steering data, just logging.
-                // I will stick to the previous float32 assumption but on the correct characteristic (STERZO_STEERING now).
-                if (e.target.value.byteLength >= 4) {
-                     state.angle = e.target.value.getFloat32(0, true);
-                     updateUI();
-                }
-            });
-
-            device.addEventListener('gattserverdisconnected', () => {
-                state.sterzoStatus = 'disconnected'; updateUI();
-            });
-
-            state.sterzoStatus = 'connected'; updateUI();
-        } catch(e) {
-            console.error("Sterzo Connection Failed", e);
-            state.sterzoStatus = 'disconnected'; updateUI();
         }
     }
 
@@ -604,7 +562,24 @@
 
     // Instantiate classes
     const gameHook = new GameHook();
-    const physicsEngine = new PhysicsEngine();
+
+    // Create Controllers
+    const trainerController = new TrainerController();
+    const sterzoController = new SterzoController();
+    const physicsEngine = new PhysicsEngine(trainerController);
+
+    // Update Init Logic to use classes
+    function initUI() {
+        if (!document.querySelector('ble-hud')) {
+            hudElement = document.createElement('ble-hud');
+            document.body.appendChild(hudElement);
+            // Bind to class methods
+            hudElement.addEventListener('pair-trainer', () => trainerController.connect());
+            hudElement.addEventListener('pair-sterzo', () => sterzoController.connect());
+
+            window.addEventListener('keydown', handleDebugInput);
+        }
+    }
 
     navigator.getGamepads = function() {
         if (!isActive) return originalGetGamepads();
