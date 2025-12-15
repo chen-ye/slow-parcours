@@ -433,13 +433,18 @@
 
                 try {
                     const service = await server.getPrimaryService(CONFIG.FTMS_SERVICE);
+
+                    const [controlChar, dataChar] = await Promise.all([
+                        service.getCharacteristic(CONFIG.FTMS_CONTROL),
+                        service.getCharacteristic(CONFIG.FTMS_DATA)
+                    ]);
+
+                    this.controlChar = controlChar;
                     try {
-                        this.controlChar = await service.getCharacteristic(CONFIG.FTMS_CONTROL);
                         await this.controlChar.writeValue(new Uint8Array([0x00])); // Request Control
                         this.sm.isControllable = true;
                     } catch(e) { console.log("Control Point fail", e); }
 
-                    const dataChar = await service.getCharacteristic(CONFIG.FTMS_DATA);
                     await dataChar.startNotifications();
                     dataChar.addEventListener('characteristicvaluechanged', (e) => this.handleFtmsData(e.target.value));
 
@@ -525,9 +530,11 @@
                 const server = await device.gatt.connect();
                 const service = await server.getPrimaryService(CONFIG.STERZO_SERVICE);
 
-                const cpChar = await service.getCharacteristic(CONFIG.STERZO_CP);
-                const challengeChar = await service.getCharacteristic(CONFIG.STERZO_CHALLENGE);
-                const steeringChar = await service.getCharacteristic(CONFIG.STERZO_STEERING);
+                const [cpChar, challengeChar, steeringChar] = await Promise.all([
+                     service.getCharacteristic(CONFIG.STERZO_CP),
+                     service.getCharacteristic(CONFIG.STERZO_CHALLENGE),
+                     service.getCharacteristic(CONFIG.STERZO_STEERING)
+                ]);
 
                 console.log("Sterzo: Characteristics found. Starting Handshake...");
 
